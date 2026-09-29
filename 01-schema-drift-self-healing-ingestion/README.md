@@ -121,7 +121,35 @@ docker exec n8n-resilient-db psql -U n8n -d n8n_resilient \
   -c "SELECT source_id, event_id, email, amount, company FROM business_leads;"
 ```
 
-<!-- Screenshots: n8n canvas, drift alert message, DLQ table before/after replay -->
+## Captured evidence (real outputs from the 2026-09-29 test run)
+
+**Drift alert delivered to the alert channel** (`GET :8888/catch` after a `tenantC` drift payload self-healed — note the mapping, confidence, LLM reasoning, and the revoke hint for the operator):
+
+```json
+{
+  "at": "2026-09-29T11:12:42.301Z",
+  "body": {
+    "text": "Schema drift auto-healed",
+    "source_id": "tenantC",
+    "mapping": { "client_mail": "customer_email", "org_name": "company" },
+    "confidence": 0.95,
+    "reasoning": "Both absent required fields have exactly one semantic equivalent received key: client_mail is an email string and maps to customer_email, org_name is an organization name and maps to company. amount already matches. No unit conversion or computation is needed; event_id and plan are extra received fields with no required counterpart.",
+    "revoke_hint": "POST /webhook/mapping-revoke {\"rule_id\":\"<source_id>:<drifted_key>\"}"
+  }
+}
+```
+
+**DLQ state machine observed across successive replays** of one poison-pill payload (`max_retries = 3`):
+
+| Step | Action | `status` | `retry_count` | Replay response |
+| :--- | :--- | :--- | :--- | :--- |
+| 0 | `unit_drift` payload fails contract + LLM refuses unit conversion | `failed` | 0 | `202 queued_to_dlq` |
+| 1 | replay #1 | `re_failed` | 1 | `422 replay_failed` |
+| 2 | replay #2 | `re_failed` | 2 | `422 replay_failed` |
+| 3 | replay #3 | `dead_permanent` | 3 | `422 replay_failed` |
+| 4 | replay #4 | `dead_permanent` | 3 | `410 not_replayable` — locked |
+
+The success loop is equally reachable: re-activate the revoked mapping, replay a governed DLQ item → `200 {"status":"replay_resolved"}`, the row flips to `resolved`, and the payload lands in `business_leads`.
 
 ## Limitations
 
