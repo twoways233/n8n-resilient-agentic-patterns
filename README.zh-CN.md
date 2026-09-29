@@ -57,6 +57,7 @@ flowchart TD
 | 单位换算陷阱 | `amount`→`total_cents`（整数分） | `202 queued_to_dlq` —— LLM 正确**拒绝**跨单位映射 |
 | 重放（可恢复失败） | 重放一次 | `422 replay_failed`，死信 → `re_failed`，`retry_count=1`，**无孤儿行** |
 | 毒丸消息 | 连续重放 ×3 | `retry_count=3` → `dead_permanent`；后续重放返回 `410` |
+| 修复后重放（全闭环） | 恢复被撤销的映射后重放治理死信 | `200 {"status":"replay_resolved"}`；死信 → `resolved`；该载荷治愈入库 |
 | 映射治理 | 撤销一条已学习规则后再投漂移数据 | LLM 试图重学 → **被治理拒绝**，路由至 DLQ；被撤销规则保持 `revoked` |
 | 多租户隔离 | `source=tenantB` 的漂移数据 | 独立缓存命名空间；`default_source` 被撤销的规则不受影响 |
 

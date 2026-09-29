@@ -57,6 +57,7 @@ flowchart TD
 | Unit-conversion trap | `amount`→`total_cents` (integer cents) | `202 queued_to_dlq` — LLM correctly **refuses** to map across units |
 | Replay (recoverable failure) | replay once | `422 replay_failed`, DLQ → `re_failed`, `retry_count=1`, **no orphan rows** |
 | Poison pill | replay ×3 | `retry_count=3` → `dead_permanent`; further replays rejected with `410` |
+| Replay after fix (full loop) | re-activate the mapping, replay the governed DLQ item | `200 {"status":"replay_resolved"}`; DLQ → `resolved`; the payload is healed and stored |
 | Mapping governance | revoke a learned rule, replay drift | LLM tries to re-learn → **rejected by governance**, routed to DLQ; revoked rule stays `revoked` |
 | Multi-tenant isolation | drift from `source=tenantB` | separate cache namespace; `default_source`'s revoked rule untouched |
 
