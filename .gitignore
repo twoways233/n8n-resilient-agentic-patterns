@@ -16,3 +16,6 @@ credentials/
 Thumbs.db
 .idea/
 .vscode/
+
+# Internal planning docs (kept local, not published)
+learn/

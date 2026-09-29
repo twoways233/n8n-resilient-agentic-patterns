@@ -1,6 +1,6 @@
 # 02 — Self-Introspecting Error Hotfix PR Generator
 
-> 🚧 **Status: in progress.** The architecture is finalized in [`../learn/n8n-portfolio-architecture-plan.md`](../learn/n8n-portfolio-architecture-plan.md) (Project 02 sections); implementation has not started yet.
+> 🚧 **Status: in progress.** The architecture is designed and summarized below; the full internal planning document is kept private.
 
 ## What it will do
 
