@@ -1,0 +1,989 @@
+{
+  "name": "01 - Schema Drift Self-Healing Ingestion",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ingest",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "a1000001-0000-4000-8000-000000000001",
+      "name": "Webhook Ingest",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-460, 300],
+      "webhookId": "ingest"
+    },
+    {
+      "parameters": {
+        "jsCode": "const crypto = require('crypto');\nconst item = $input.first().json;\nconst rawPayload = item.body || item;\n\n// Source scope key: prevents cross-source mapping-cache pollution.\n// Header is authoritative; payload 'source' is a convenience fallback (spoofable - documented). \nconst sourceId =\n  (item.headers && (item.headers['x-source-id'] || item.headers['X-Source-Id'])) ||\n  (rawPayload && rawPayload.source) ||\n  'default_source';\n\n// Recursive canonical serialization: sort keys at EVERY nesting level.\n// (JSON.stringify's array replacer silently drops nested keys - do NOT use it.)\nfunction canonicalize(val) {\n  if (val === null || typeof val !== 'object') return val;\n  if (Array.isArray(val)) return val.map(canonicalize);\n  return Object.keys(val).sort().reduce((acc, key) => {\n    acc[key] = canonicalize(val[key]);\n    return acc;\n  }, {});\n}\n\nconst canonicalJson = JSON.stringify(canonicalize(rawPayload));\nconst fingerprint = crypto.createHash('sha256').update(canonicalJson).digest('hex');\n// Fall back to the fingerprint so business_leads.event_id (NOT NULL) never receives null\nconst eventId = rawPayload.event_id || fingerprint;\nconst idempotencyKey = `${sourceId}:${rawPayload.event_id || fingerprint}`;\n\nreturn [{ json: { sourceId, idempotencyKey, eventId, rawPayload } }];"
+      },
+      "id": "a1000001-0000-4000-8000-000000000002",
+      "name": "Extract & Fingerprint",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-240, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO idempotency_keys (key, status) VALUES ($1, 'PROCESSING') ON CONFLICT (key) DO NOTHING RETURNING key;",
+        "options": {
+          "queryReplacement": "={{ [$json.idempotencyKey] }}"
+        }
+      },
+      "id": "a1000001-0000-4000-8000-000000000003",
+      "name": "Idempotency Claim",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [-20, 300],
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "n8n-resilient-postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-is-new",
+              "leftValue": "={{ $json.key !== undefined }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a1000001-0000-4000-8000-000000000004",
+      "name": "Is New Event?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [200, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT status FROM idempotency_keys WHERE key = $1;",
+        "options": {
+          "queryReplacement": "={{ [$('Extract & Fingerprint').first().json.idempotencyKey] }}"
+        }
+      },
+      "id": "a1000001-0000-4000-8000-00000000001b",
+      "name": "Check Key Status",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [420, 480],
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "n8n-resilient-postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-resolved-dup",
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "resolved",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a1000001-0000-4000-8000-00000000001c",
+      "name": "Resolved Duplicate?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [640, 480]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'duplicate_skipped', idempotencyKey: $('Extract & Fingerprint').first().json.idempotencyKey } }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "a1000001-0000-4000-8000-000000000005",
+      "name": "Respond: Idempotent Skip",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [860, 380]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'duplicate_unresolved', key_status: $json.status, hint: 'Previously failed events are reprocessed via POST /webhook/dlq-replay' } }}",
+        "options": {
+          "responseCode": 409
+        }
+      },
+      "id": "a1000001-0000-4000-8000-00000000001d",
+      "name": "Respond: Duplicate Conflict",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [860, 580]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT rule_id, drifted_key, target_key FROM field_mapping_cache WHERE source_id = $1 AND status = 'active';",
+        "options": {
+          "queryReplacement": "={{ [$('Extract & Fingerprint').first().json.sourceId] }}"
+        }
+      },
+      "id": "a1000001-0000-4000-8000-000000000006",
+      "name": "Load Active Mappings",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [420, 120],
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "n8n-resilient-postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const fp = $('Extract & Fingerprint').first().json;\nconst rawPayload = fp.rawPayload;\nconst mappingRows = $('Load Active Mappings').all()\n  .map(r => r.json)\n  .filter(r => r && r.rule_id);\n\nconst normalized = { ...rawPayload };\nconst appliedRules = [];\nfor (const row of mappingRows) {\n  if (normalized[row.target_key] === undefined && normalized[row.drifted_key] !== undefined) {\n    normalized[row.target_key] = normalized[row.drifted_key];\n    appliedRules.push(row.rule_id);\n  }\n}\n\nreturn [{ json: { sourceId: fp.sourceId, idempotencyKey: fp.idempotencyKey, eventId: fp.eventId, rawPayload, normalized, appliedRules } }];"
+      },
+      "id": "a1000001-0000-4000-8000-000000000007",
+      "name": "Normalize",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [640, 120]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE field_mapping_cache SET hit_count = hit_count + 1 WHERE rule_id IN (SELECT j FROM jsonb_array_elements_text($1::jsonb) AS j) RETURNING rule_id;",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify($json.appliedRules) ] }}"
+        }
+      },
+      "id": "a1000001-0000-4000-8000-000000000018",
+      "name": "Bump Hit Count",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [760, 120],
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "n8n-resilient-postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Read from Normalize, NOT $input: the direct predecessor is Bump Hit Count (a Postgres\n// node whose output is RETURNING rows, not the normalized payload).\nconst inp = $('Normalize').first().json;\nconst n = inp.normalized || {};\nconst EMAIL_RE = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]{2,}$/;\n\nconst failures = [];\nif (typeof n.customer_email !== 'string' || !EMAIL_RE.test(n.customer_email)) {\n  failures.push('customer_email: expected non-empty email string');\n}\nif (typeof n.amount !== 'number' || !isFinite(n.amount)) {\n  failures.push('amount: expected finite number');\n}\nif (typeof n.company !== 'string' || n.company.trim() === '') {\n  failures.push('company: expected non-empty string');\n}\n\n// Type skeleton for the LLM: key names + type signatures only, never raw values (PII-safe)\nfunction typeSignature(v) {\n  if (typeof v === 'string') return EMAIL_RE.test(v) ? 'string (email)' : 'string';\n  if (typeof v === 'number') return 'number';\n  if (typeof v === 'boolean') return 'boolean';\n  if (Array.isArray(v)) return 'array';\n  if (v === null) return 'null';\n  return typeof v === 'object' ? 'object' : 'unknown';\n}\nconst received_skeleton = {};\nfor (const [k, v] of Object.entries(n)) received_skeleton[k] = typeSignature(v);\n\nconst expected_schema = { customer_email: 'string (email)', amount: 'number', company: 'string' };\n\nreturn [{ json: { ...inp, valid: failures.length === 0, failures, expected_schema, received_skeleton } }];"
+      },
+      "id": "a1000001-0000-4000-8000-000000000008",
+      "name": "Contract Validation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [880, 120]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-valid",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a1000001-0000-4000-8000-000000000009",
+      "name": "Contract Pass?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1100, 120]
+    },
+    {
+      "parameters": {
+        "jsCode": "const inp = $input.first().json;\nconst systemPrompt = [\n  'You are a strict schema mapping validator.',\n  'Input: an expected schema and a received skeleton (key names + type signatures only; values are redacted).',\n  'Task: decide whether UNKNOWN received keys can be renamed 1:1 to the expected keys by semantic equivalence.',\n  'Decision rule: a required field that is absent by name IS recoverable when exactly one unknown key is its semantic equivalent (a pure key rename).',\n  'Set is_recoverable=true only if EVERY absent required field has exactly one such mapping and mapping covers them all.',\n  'Set is_recoverable=false ONLY if: an absent required field has NO semantic counterpart, the mapping is ambiguous (multiple candidate keys), or a value transformation (unit conversion, computation, split/merge) would be required.',\n  'NEVER map across units (e.g. total_cents -> amount) and never invent data.',\n  'Respond ONLY with JSON: {\"is_recoverable\": boolean, \"confidence\": number (0-1), \"mapping\": {\"drifted_key\": \"target_key\"}, \"unmapped_fields\": [string], \"reasoning\": string}.'\n].join(' ');\nconst userPrompt = JSON.stringify({\n  expected_schema: inp.expected_schema,\n  received_skeleton: inp.received_skeleton,\n  validation_failures: inp.failures\n});\nreturn [{ json: { systemPrompt, userPrompt } }];"
+      },
+      "id": "a1000001-0000-4000-8000-00000000000d",
+      "name": "Build Healer Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1320, 340]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.deepseek.com/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'deepseek-flash', temperature: 0, response_format: { type: 'json_object' }, messages: [ { role: 'system', content: $json.systemPrompt }, { role: 'user', content: $json.userPrompt } ] }) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "a1000001-0000-4000-8000-00000000000e",
+      "name": "LLM Schema Healer",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1540, 340],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME",
+          "name": "DeepSeek API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const resp = $input.first().json;\nlet verdict;\ntry {\n  const raw = resp.choices && resp.choices[0] && resp.choices[0].message && resp.choices[0].message.content;\n  verdict = typeof raw === 'string' ? JSON.parse(raw) : raw;\n} catch (e) {\n  verdict = { is_recoverable: false, confidence: 0, mapping: {}, unmapped_fields: [], reasoning: 'LLM response was not parseable JSON: ' + e.message };\n}\n// Structural guard against hallucinated shapes\nif (!verdict || typeof verdict !== 'object' || typeof verdict.confidence !== 'number' || typeof verdict.mapping !== 'object' || verdict.mapping === null) {\n  verdict = { is_recoverable: false, confidence: 0, mapping: {}, unmapped_fields: [], reasoning: 'Verdict failed structural validation.' };\n}\nconst prev = $('Contract Validation').first().json;\nreturn [{ json: { ...prev, is_recoverable: !!verdict.is_recoverable, confidence: verdict.confidence, mapping: verdict.mapping, unmapped_fields: verdict.unmapped_fields || [], reasoning: verdict.reasoning || '' } }];"
+      },
+      "id": "a1000001-0000-4000-8000-00000000000f",
+      "name": "Parse Healer Verdict",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1760, 340]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-recoverable",
+              "leftValue": "={{ $json.is_recoverable && $json.confidence >= 0.95 && Object.keys($json.mapping).length > 0 }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a1000001-0000-4000-8000-000000000010",
+      "name": "Recoverable & Confident?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1980, 340]
+    },
+    {
+      "parameters": {
+        "jsCode": "const crypto = require('crypto');\nconst inp = $input.first().json;\nconst out = [];\nfor (const [drifted, target] of Object.entries(inp.mapping)) {\n  const sampleValue = inp.rawPayload ? inp.rawPayload[drifted] : undefined;\n  const sampleHash = crypto.createHash('sha256').update(String(sampleValue)).digest('hex');\n  out.push({ json: {\n    rule_id: `${inp.sourceId}:${drifted}`,\n    source_id: inp.sourceId,\n    drifted_key: drifted,\n    target_key: target,\n    confidence: inp.confidence,\n    sample_value_hash: sampleHash,\n    reasoning: inp.reasoning\n  } });\n}\nreturn out;"
+      },
+      "id": "a1000001-0000-4000-8000-000000000011",
+      "name": "Mapping To Rows",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2200, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "const inp = $('Contract Validation').first().json;\nconst mapping = $('Parse Healer Verdict').first().json.mapping;\nconst normalized = { ...inp.normalized };\nfor (const [drifted, target] of Object.entries(mapping)) {\n  if (normalized[target] === undefined && normalized[drifted] !== undefined) {\n    normalized[target] = normalized[drifted];\n  }\n}\nreturn [{ json: {\n  sourceId: inp.sourceId,\n  idempotencyKey: inp.idempotencyKey,\n  eventId: inp.eventId,\n  normalized,\n  rawPayload: inp.rawPayload,\n  selfHealed: true,\n  driftAlert: {\n    message: 'Schema drift detected and auto-healed',\n    source_id: inp.sourceId,\n    mapping,\n    confidence: $('Parse Healer Verdict').first().json.confidence,\n    reasoning: $('Parse Healer Verdict').first().json.reasoning\n  }\n} }];"
+      },
+      "id": "a1000001-0000-4000-8000-000000000013",
+      "name": "Heal & Persist Prep",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2420, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "const inp = $input.first().json;\nconst n = inp.normalized || {};\nconst EMAIL_RE = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]{2,}$/;\n\n// LLM mappings must survive the SAME deterministic contract before anything is\n// persisted or cached. Without this, a hallucinated or partial mapping would\n// silently write nulls - exactly the \"green light dirty write\" this workflow\n// exists to prevent.\nconst failures = [];\nif (typeof n.customer_email !== 'string' || !EMAIL_RE.test(n.customer_email)) {\n  failures.push('customer_email: expected non-empty email string');\n}\nif (typeof n.amount !== 'number' || !isFinite(n.amount)) {\n  failures.push('amount: expected finite number');\n}\nif (typeof n.company !== 'string' || n.company.trim() === '') {\n  failures.push('company: expected non-empty string');\n}\n\nreturn [{ json: { ...inp, valid: failures.length === 0, healedFailures: failures } }];"
+      },
+      "id": "a1000001-0000-4000-8000-000000000019",
+      "name": "Validate Healed Record",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2640, 200]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-healed-valid",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a1000001-0000-4000-8000-00000000001a",
+      "name": "Healed Contract Pass?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [2860, 200]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO field_mapping_cache (rule_id, source_id, drifted_key, target_key, confidence, sample_value_hash, status) SELECT j->>'rule_id', j->>'source_id', j->>'drifted_key', j->>'target_key', (j->>'confidence')::numeric, j->>'sample_value_hash', 'active' FROM jsonb_array_elements($1::jsonb) AS j ON CONFLICT (source_id, drifted_key) DO UPDATE SET target_key = EXCLUDED.target_key, confidence = EXCLUDED.confidence, learned_at = now(), hit_count = 0 WHERE field_mapping_cache.status <> 'revoked' RETURNING rule_id;",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify($('Mapping To Rows').all().map(r => r.json)) ] }}"
+        }
+      },
+      "id": "a1000001-0000-4000-8000-000000000012",
+      "name": "Save Learned Mapping",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [3080, 140],
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "n8n-resilient-postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const attempted = $('Mapping To Rows').all().length;\nconst accepted = $input.all().filter(r => r.json && r.json.rule_id).length;\nreturn [{ json: { accepted: accepted > 0 && accepted === attempted, attempted, acceptedCount: accepted } }];"
+      },
+      "id": "a1000001-0000-4000-8000-00000000001e",
+      "name": "Check Mapping Governance",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3300, 140]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-governance",
+              "leftValue": "={{ $json.accepted }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a1000001-0000-4000-8000-00000000001f",
+      "name": "Mapping Accepted?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [3520, 140]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.DRIFT_ALERT_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: 'Schema drift auto-healed', ...$('Heal & Persist Prep').first().json.driftAlert, revoke_hint: 'POST /webhook/mapping-revoke {\"rule_id\":\"<source_id>:<drifted_key>\"}' }) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "a1000001-0000-4000-8000-000000000020",
+      "name": "Send Drift Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3740, 260],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Single assembly point for both persist paths: direct pass and self-healed.\nconst v = $('Validate Healed Record').isExecuted\n  ? $('Validate Healed Record').first().json\n  : $('Contract Validation').first().json;\nreturn [{ json: { sourceId: v.sourceId, eventId: v.eventId, normalized: v.normalized, rawPayload: v.rawPayload } }];"
+      },
+      "id": "a1000001-0000-4000-8000-000000000021",
+      "name": "Assemble Business Record",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3740, 60]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO business_leads (source_id, event_id, email, amount, company, plan, raw_payload) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb) ON CONFLICT (source_id, event_id) DO UPDATE SET email = EXCLUDED.email, amount = EXCLUDED.amount, company = EXCLUDED.company, plan = EXCLUDED.plan, raw_payload = EXCLUDED.raw_payload RETURNING id;",
+        "options": {
+          "queryReplacement": "={{ [$json.sourceId, $json.eventId, $json.normalized.customer_email, $json.normalized.amount, $json.normalized.company, $json.normalized.plan || null, JSON.stringify($json.rawPayload)] }}"
+        }
+      },
+      "id": "a1000001-0000-4000-8000-00000000000a",
+      "name": "Persist Business Record",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [3960, 60],
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "n8n-resilient-postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE idempotency_keys SET status = 'resolved' WHERE key = $1 RETURNING key;",
+        "options": {
+          "queryReplacement": "={{ [$('Extract & Fingerprint').first().json.idempotencyKey] }}"
+        }
+      },
+      "id": "a1000001-0000-4000-8000-00000000000b",
+      "name": "Mark Resolved",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [4180, 60],
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "n8n-resilient-postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'stored', self_healed: $('Parse Healer Verdict').isExecuted, event_id: $('Contract Validation').first().json.eventId } }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "a1000001-0000-4000-8000-00000000000c",
+      "name": "Respond: Success",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [4400, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "const crypto = require('crypto');\nconst govRan = $('Check Mapping Governance').isExecuted;\nconst govRejected = govRan && $('Check Mapping Governance').first().json.accepted === false;\nconst lastValidation = $('Validate Healed Record').isExecuted\n  ? $('Validate Healed Record').first().json\n  : $('Contract Validation').first().json;\nconst healerRan = $('Parse Healer Verdict').isExecuted;\nconst reasonBase = govRejected\n  ? 'Learned mapping rejected by governance (previously revoked by operator)'\n  : healerRan\n    ? 'LLM could not safely map: ' + (($('Parse Healer Verdict').first().json.reasoning) || '')\n    : 'Contract validation failed';\nconst failures = lastValidation.healedFailures || lastValidation.failures || [];\n\nreturn [{ json: {\n  dlq_id: crypto.randomUUID(),\n  sourceId: lastValidation.sourceId,\n  idempotencyKey: $('Extract & Fingerprint').first().json.idempotencyKey,\n  payloadJson: JSON.stringify(lastValidation.rawPayload),\n  failureReason: (reasonBase + ' | failures: ' + JSON.stringify(failures)).slice(0, 500)\n} }];"
+      },
+      "id": "a1000001-0000-4000-8000-000000000014",
+      "name": "Prep DLQ Entry",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2900, 620]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO dlq (dlq_id, source_id, idempotency_key, payload, failure_reason, status) VALUES ($1, $2, $3, $4::jsonb, $5, 'failed') ON CONFLICT (idempotency_key) DO UPDATE SET failure_reason = EXCLUDED.failure_reason, updated_at = now() RETURNING dlq_id;",
+        "options": {
+          "queryReplacement": "={{ [$json.dlq_id, $json.sourceId, $json.idempotencyKey, $json.payloadJson, $json.failureReason] }}"
+        }
+      },
+      "id": "a1000001-0000-4000-8000-000000000015",
+      "name": "Write DLQ",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [3120, 620],
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "n8n-resilient-postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.DLQ_ALERT_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: 'Event queued to DLQ', dlq_id: $('Prep DLQ Entry').first().json.dlq_id, failure_reason: $('Prep DLQ Entry').first().json.failureReason, replay_hint: 'POST /webhook/dlq-replay {\"dlq_id\":\"<uuid>\"}' }) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "a1000001-0000-4000-8000-000000000022",
+      "name": "Send DLQ Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3120, 780],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE idempotency_keys SET status = 'failed' WHERE key = $1 RETURNING key;",
+        "options": {
+          "queryReplacement": "={{ [$('Prep DLQ Entry').first().json.idempotencyKey] }}"
+        }
+      },
+      "id": "a1000001-0000-4000-8000-000000000016",
+      "name": "Mark Failed",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [3340, 620],
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "n8n-resilient-postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'queued_to_dlq', dlq_id: $('Prep DLQ Entry').first().json.dlq_id, failure_reason: $('Prep DLQ Entry').first().json.failureReason } }}",
+        "options": {
+          "responseCode": 202
+        }
+      },
+      "id": "a1000001-0000-4000-8000-000000000017",
+      "name": "Respond: Queued to DLQ",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [3560, 620]
+    }
+  ],
+  "connections": {
+    "Webhook Ingest": {
+      "main": [
+        [
+          {
+            "node": "Extract & Fingerprint",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract & Fingerprint": {
+      "main": [
+        [
+          {
+            "node": "Idempotency Claim",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Idempotency Claim": {
+      "main": [
+        [
+          {
+            "node": "Is New Event?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is New Event?": {
+      "main": [
+        [
+          {
+            "node": "Load Active Mappings",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Check Key Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Key Status": {
+      "main": [
+        [
+          {
+            "node": "Resolved Duplicate?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolved Duplicate?": {
+      "main": [
+        [
+          {
+            "node": "Respond: Idempotent Skip",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond: Duplicate Conflict",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Active Mappings": {
+      "main": [
+        [
+          {
+            "node": "Normalize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize": {
+      "main": [
+        [
+          {
+            "node": "Bump Hit Count",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Bump Hit Count": {
+      "main": [
+        [
+          {
+            "node": "Contract Validation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Contract Validation": {
+      "main": [
+        [
+          {
+            "node": "Contract Pass?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Contract Pass?": {
+      "main": [
+        [
+          {
+            "node": "Assemble Business Record",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Healer Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Healer Prompt": {
+      "main": [
+        [
+          {
+            "node": "LLM Schema Healer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LLM Schema Healer": {
+      "main": [
+        [
+          {
+            "node": "Parse Healer Verdict",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Healer Verdict": {
+      "main": [
+        [
+          {
+            "node": "Recoverable & Confident?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Recoverable & Confident?": {
+      "main": [
+        [
+          {
+            "node": "Mapping To Rows",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prep DLQ Entry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mapping To Rows": {
+      "main": [
+        [
+          {
+            "node": "Heal & Persist Prep",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Heal & Persist Prep": {
+      "main": [
+        [
+          {
+            "node": "Validate Healed Record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Healed Record": {
+      "main": [
+        [
+          {
+            "node": "Healed Contract Pass?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Healed Contract Pass?": {
+      "main": [
+        [
+          {
+            "node": "Save Learned Mapping",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prep DLQ Entry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Learned Mapping": {
+      "main": [
+        [
+          {
+            "node": "Check Mapping Governance",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Mapping Governance": {
+      "main": [
+        [
+          {
+            "node": "Mapping Accepted?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mapping Accepted?": {
+      "main": [
+        [
+          {
+            "node": "Assemble Business Record",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Send Drift Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prep DLQ Entry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assemble Business Record": {
+      "main": [
+        [
+          {
+            "node": "Persist Business Record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Persist Business Record": {
+      "main": [
+        [
+          {
+            "node": "Mark Resolved",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Resolved": {
+      "main": [
+        [
+          {
+            "node": "Respond: Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prep DLQ Entry": {
+      "main": [
+        [
+          {
+            "node": "Write DLQ",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write DLQ": {
+      "main": [
+        [
+          {
+            "node": "Mark Failed",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Send DLQ Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Failed": {
+      "main": [
+        [
+          {
+            "node": "Respond: Queued to DLQ",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "meta": {
+    "instanceId": "local-dev"
+  }
+}

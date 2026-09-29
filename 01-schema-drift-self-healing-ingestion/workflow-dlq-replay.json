@@ -1,0 +1,365 @@
+{
+  "name": "01b - DLQ Replay",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "dlq-replay",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "b1000001-0000-4000-8000-000000000001",
+      "name": "DLQ Replay Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-460, 300],
+      "webhookId": "dlq-replay"
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $input.first().json;\nconst dlqId = (item.body && item.body.dlq_id) || item.dlq_id;\nif (!dlqId) {\n  throw new Error('Missing dlq_id. POST { \"dlq_id\": \"<uuid>\" } to this webhook.');\n}\nreturn [{ json: { dlqId } }];"
+      },
+      "id": "b1000001-0000-4000-8000-000000000002",
+      "name": "Parse Replay Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-240, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE dlq SET status = 'replaying', retry_count = retry_count + 1, updated_at = now() WHERE dlq_id = $1 AND ( (status IN ('failed', 're_failed') AND retry_count < max_retries) OR (status = 'replaying' AND updated_at < now() - interval '10 minutes') ) RETURNING dlq_id, retry_count, max_retries, payload, source_id, idempotency_key;",
+        "options": {
+          "queryReplacement": "={{ [$json.dlqId] }}"
+        }
+      },
+      "id": "b1000001-0000-4000-8000-000000000003",
+      "name": "Claim DLQ Item",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [-20, 300],
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "n8n-resilient-postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-claimed",
+              "leftValue": "={{ $json.dlq_id !== undefined }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "b1000001-0000-4000-8000-000000000004",
+      "name": "Claimed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [200, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT status, retry_count, max_retries FROM dlq WHERE dlq_id = $1;",
+        "options": {
+          "queryReplacement": "={{ [$('Parse Replay Request').first().json.dlqId] }}"
+        }
+      },
+      "id": "b1000001-0000-4000-8000-000000000005",
+      "name": "Read DLQ State",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [420, 480],
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "n8n-resilient-postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'not_replayable', dlq_status: $json.status, retry_count: $json.retry_count, max_retries: $json.max_retries } }}",
+        "options": {
+          "responseCode": "={{ $json.status === 'dead_permanent' ? 410 : 409 }}"
+        }
+      },
+      "id": "b1000001-0000-4000-8000-000000000006",
+      "name": "Respond: Not Replayable",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [640, 480]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "DELETE FROM idempotency_keys WHERE key = $1 RETURNING key;",
+        "options": {
+          "queryReplacement": "={{ [$('Claim DLQ Item').first().json.idempotency_key] }}"
+        }
+      },
+      "id": "b1000001-0000-4000-8000-000000000007",
+      "name": "Clear Idempotency Key",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [420, 120],
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "n8n-resilient-postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://n8n:5678/webhook/ingest",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-source-id",
+              "value": "={{ $('Claim DLQ Item').first().json.source_id }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($('Claim DLQ Item').first().json.payload) }}",
+        "options": {}
+      },
+      "id": "b1000001-0000-4000-8000-000000000008",
+      "name": "Replay To Ingestion",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [640, 120],
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE dlq SET status = CASE WHEN $2 = 'stored' THEN 'resolved' WHEN $2 = 'queued_to_dlq' THEN (CASE WHEN retry_count >= max_retries THEN 'dead_permanent' ELSE 're_failed' END) ELSE 're_failed' END, updated_at = now() WHERE dlq_id = $1 RETURNING status, retry_count, max_retries;",
+        "options": {
+          "queryReplacement": "={{ [$('Claim DLQ Item').first().json.dlq_id, $json.status] }}"
+        }
+      },
+      "id": "b1000001-0000-4000-8000-000000000009",
+      "name": "Record Replay Outcome",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [860, 120],
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "n8n-resilient-postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-resolved",
+              "leftValue": "={{ $json.status === 'resolved' }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "b1000001-0000-4000-8000-00000000000a",
+      "name": "Replay Resolved?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1080, 120]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'replay_resolved', dlq_status: 'resolved' } }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "b1000001-0000-4000-8000-00000000000b",
+      "name": "Respond: Replay Resolved",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1300, 0]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'replay_failed', dlq_status: $json.status, retry_count: $json.retry_count, max_retries: $json.max_retries } }}",
+        "options": {
+          "responseCode": 422
+        }
+      },
+      "id": "b1000001-0000-4000-8000-00000000000c",
+      "name": "Respond: Replay Failed",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1300, 240]
+    }
+  ],
+  "connections": {
+    "DLQ Replay Trigger": {
+      "main": [
+        [
+          {
+            "node": "Parse Replay Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Replay Request": {
+      "main": [
+        [
+          {
+            "node": "Claim DLQ Item",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim DLQ Item": {
+      "main": [
+        [
+          {
+            "node": "Claimed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claimed?": {
+      "main": [
+        [
+          {
+            "node": "Clear Idempotency Key",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Read DLQ State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read DLQ State": {
+      "main": [
+        [
+          {
+            "node": "Respond: Not Replayable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clear Idempotency Key": {
+      "main": [
+        [
+          {
+            "node": "Replay To Ingestion",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Replay To Ingestion": {
+      "main": [
+        [
+          {
+            "node": "Record Replay Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Replay Outcome": {
+      "main": [
+        [
+          {
+            "node": "Replay Resolved?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Replay Resolved?": {
+      "main": [
+        [
+          {
+            "node": "Respond: Replay Resolved",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond: Replay Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "meta": {
+    "instanceId": "local-dev"
+  }
+}

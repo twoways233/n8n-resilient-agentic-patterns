@@ -1,0 +1,10 @@
+{
+  "name": "mock-chaos-server",
+  "version": "1.0.0",
+  "description": "Chaos injector for n8n webhook ingestion: duplicate delivery, schema drift, dirty payloads.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "license": "MIT"
+}

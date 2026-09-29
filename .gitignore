@@ -1,0 +1,18 @@
+# n8n local data
+n8n-data/
+*.sqlite
+*.sqlite-journal
+
+# Dependencies
+node_modules/
+
+# Secrets & credentials
+.env
+credentials/
+*.key
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

@@ -1,0 +1,63 @@
+services:
+  n8n:
+    # Pinned for reproducibility; bump deliberately after testing
+    image: n8nio/n8n:2.40.7
+    container_name: n8n-resilient
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    environment:
+      - GENERIC_TIMEZONE=Asia/Shanghai
+      - TZ=Asia/Shanghai
+      # Code node sandbox: allow require('crypto') for fingerprinting
+      - NODE_FUNCTION_ALLOW_BUILTIN=crypto
+      # Persist execution data of failed runs (required by Project 02 introspection)
+      - EXECUTIONS_DATA_SAVE_ON_ERROR=all
+      - EXECUTIONS_DATA_SAVE_ON_SUCCESS=all
+      - EXECUTIONS_DATA_MAX_AGE=168
+      - N8N_DIAGNOSTICS_ENABLED=false
+      - N8N_PERSONALIZATION_ENABLED=false
+      - N8N_RUNNERS_ENABLED=true
+      # Allow $env in node expressions: alert nodes read the two webhook URLs below via
+      # {{ $env.* }} (blocked by default). Empty value = alert disabled (fail-open).
+      - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
+      # Optional alert channels (Slack/Discord/Telegram webhook URLs). Leave empty to disable.
+      - DRIFT_ALERT_WEBHOOK_URL=
+      - DLQ_ALERT_WEBHOOK_URL=
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - n8n-data:/home/node/.n8n
+      # Project workflow JSON files are imported manually via the UI
+      - ./:/home/node/project:ro
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: n8n-resilient-db
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=n8n
+      - POSTGRES_PASSWORD=n8n
+      - POSTGRES_DB=n8n_resilient
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U n8n -d n8n_resilient"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+
+  mock-chaos-server:
+    build: ./mock-chaos-server
+    container_name: mock-chaos
+    restart: unless-stopped
+    ports:
+      - "8888:8888"
+
+volumes:
+  n8n-data:
+  pg-data:

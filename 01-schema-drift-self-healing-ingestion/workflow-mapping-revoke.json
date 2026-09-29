@@ -1,0 +1,169 @@
+{
+  "name": "01c - Mapping Revoke",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "mapping-revoke",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "c1000001-0000-4000-8000-000000000001",
+      "name": "Mapping Revoke Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-460, 300],
+      "webhookId": "mapping-revoke"
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $input.first().json;\nconst ruleId = (item.body && item.body.rule_id) || item.rule_id;\nif (!ruleId) {\n  throw new Error('Missing rule_id. POST { \"rule_id\": \"<source_id>:<drifted_key>\" } to this webhook.');\n}\nreturn [{ json: { ruleId } }];"
+      },
+      "id": "c1000001-0000-4000-8000-000000000002",
+      "name": "Parse Revoke Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-240, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE field_mapping_cache SET status = 'revoked' WHERE rule_id = $1 AND status = 'active' RETURNING rule_id, source_id, drifted_key, target_key;",
+        "options": {
+          "queryReplacement": "={{ [$json.ruleId] }}"
+        }
+      },
+      "id": "c1000001-0000-4000-8000-000000000003",
+      "name": "Revoke Mapping",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [-20, 300],
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "n8n-resilient-postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-revoked",
+              "leftValue": "={{ $json.rule_id !== undefined }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c1000001-0000-4000-8000-000000000004",
+      "name": "Revoked?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [200, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'revoked', rule_id: $json.rule_id, mapping: { drifted_key: $json.drifted_key, target_key: $json.target_key }, note: 'Records learned since this mapping became active should be audited' } }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "c1000001-0000-4000-8000-000000000005",
+      "name": "Respond: Revoked",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [420, 180]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'not_found_or_already_revoked', rule_id: $('Parse Revoke Request').first().json.ruleId } }}",
+        "options": {
+          "responseCode": 404
+        }
+      },
+      "id": "c1000001-0000-4000-8000-000000000006",
+      "name": "Respond: Not Found",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [420, 420]
+    }
+  ],
+  "connections": {
+    "Mapping Revoke Trigger": {
+      "main": [
+        [
+          {
+            "node": "Parse Revoke Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Revoke Request": {
+      "main": [
+        [
+          {
+            "node": "Revoke Mapping",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Revoke Mapping": {
+      "main": [
+        [
+          {
+            "node": "Revoked?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Revoked?": {
+      "main": [
+        [
+          {
+            "node": "Respond: Revoked",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond: Not Found",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "meta": {
+    "instanceId": "local-dev"
+  }
+}
