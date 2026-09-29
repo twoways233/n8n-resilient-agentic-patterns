@@ -19,11 +19,12 @@ services:
       - N8N_PERSONALIZATION_ENABLED=false
       - N8N_RUNNERS_ENABLED=true
       # Allow $env in node expressions: alert nodes read the two webhook URLs below via
-      # {{ $env.* }} (blocked by default). Empty value = alert disabled (fail-open).
+      # {{ $env.* }} (blocked by default).
       - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
-      # Optional alert channels (Slack/Discord/Telegram webhook URLs). Leave empty to disable.
-      - DRIFT_ALERT_WEBHOOK_URL=
-      - DLQ_ALERT_WEBHOOK_URL=
+      # Alert channels: default to the local catcher in mock-chaos-server (view at /catch).
+      # Replace with a Slack/Discord/Telegram webhook URL for real notifications.
+      - DRIFT_ALERT_WEBHOOK_URL=http://mock-chaos-server:8888/catch
+      - DLQ_ALERT_WEBHOOK_URL=http://mock-chaos-server:8888/catch
     depends_on:
       postgres:
         condition: service_healthy

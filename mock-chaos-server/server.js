@@ -4,6 +4,8 @@ const crypto = require('crypto');
 const PORT = process.env.PORT || 8888;
 const DEFAULT_TARGET = process.env.TARGET || 'http://n8n:5678/webhook/ingest';
 
+let caughtAlerts = [];
+
 const GOOD_PAYLOAD = {
   event_id: 'evt-1001',
   customer_email: 'alice@example.com',
@@ -63,11 +65,29 @@ function post(target, payload, headers) {
 
 const server = http.createServer(async (req, res) => {
   const u = new URL(req.url, `http://localhost:${PORT}`);
+
+  if (u.pathname === '/catch' && req.method === 'POST') {
+    // Local alert catcher: point DRIFT_ALERT_WEBHOOK_URL / DLQ_ALERT_WEBHOOK_URL here
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', () => {
+      caughtAlerts.unshift({ at: new Date().toISOString(), body: body.slice(0, 1000) });
+      caughtAlerts = caughtAlerts.slice(0, 10);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{"status":"caught"}');
+    });
+    return;
+  }
+  if (u.pathname === '/catch' && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify(caughtAlerts, null, 2));
+  }
+
   if (u.pathname !== '/fire') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({
       service: 'mock-chaos-server',
-      usage: 'GET /fire?mode=normal|duplicate|drift|unit_drift|dirty&target=<url>&times=<n>&source=<source-id>',
+      usage: 'GET /fire?mode=normal|duplicate|drift|unit_drift|dirty&target=<url>&times=<n>&source=<source-id>  ·  GET /catch (last alerts)',
       default_target: DEFAULT_TARGET,
     }));
   }
