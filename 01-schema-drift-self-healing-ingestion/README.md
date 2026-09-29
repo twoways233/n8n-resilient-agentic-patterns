@@ -49,7 +49,7 @@ Three failure modes break naive n8n ingestion pipelines:
 11. `Validate Healed Record` → `Healed Contract Pass?` — **the healed record must re-pass the same deterministic contract**. A hallucinated or partial mapping cannot reach the database.
 12. `Save Learned Mapping` — upserts the mapping **but never overwrites a `revoked` rule** (`DO UPDATE ... WHERE status <> 'revoked'`).
 13. `Check Mapping Governance` → `Mapping Accepted?` — reconciliation: attempted rules must equal accepted rules; a rule that was revoked by an operator sends this event to the DLQ instead of silently re-activating.
-14. `Assemble Business Record` → `Persist Business Record` (upsert, `RETURNING id` = row-count assertion) → `Mark Resolved` → `200 stored` with `self_healed` flag.
+14. `Assemble Business Record` → `Persist Business Record` (idempotent upsert — `DO UPDATE ... RETURNING id` makes a silent zero-row write structurally impossible) → `Mark Resolved` → `200 stored` with `self_healed` flag.
 15. `Send Drift Alert` — posts the mapping + revoke hint to the configured webhook (fail-open).
 
 **Dead-letter path**

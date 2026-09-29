@@ -277,6 +277,7 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [1540, 340],
+      "onError": "continueRegularOutput",
       "credentials": {
         "httpHeaderAuth": {
           "id": "REPLACE_ME",
@@ -286,7 +287,7 @@
     },
     {
       "parameters": {
-        "jsCode": "const resp = $input.first().json;\nlet verdict;\ntry {\n  const raw = resp.choices && resp.choices[0] && resp.choices[0].message && resp.choices[0].message.content;\n  verdict = typeof raw === 'string' ? JSON.parse(raw) : raw;\n} catch (e) {\n  verdict = { is_recoverable: false, confidence: 0, mapping: {}, unmapped_fields: [], reasoning: 'LLM response was not parseable JSON: ' + e.message };\n}\n// Structural guard against hallucinated shapes\nif (!verdict || typeof verdict !== 'object' || typeof verdict.confidence !== 'number' || typeof verdict.mapping !== 'object' || verdict.mapping === null) {\n  verdict = { is_recoverable: false, confidence: 0, mapping: {}, unmapped_fields: [], reasoning: 'Verdict failed structural validation.' };\n}\nconst prev = $('Contract Validation').first().json;\nreturn [{ json: { ...prev, is_recoverable: !!verdict.is_recoverable, confidence: verdict.confidence, mapping: verdict.mapping, unmapped_fields: verdict.unmapped_fields || [], reasoning: verdict.reasoning || '' } }];"
+        "jsCode": "const resp = $input.first().json;\nlet verdict;\nif (!resp || resp.error || !resp.choices) {\n  // onError:continueRegularOutput lands here on HTTP failure (timeout / 401 / 429 / 5xx):\n  // route to DLQ and mark failed instead of locking the idempotency key in PROCESSING\n  verdict = { is_recoverable: false, confidence: 0, mapping: {}, unmapped_fields: [], reasoning: 'LLM call failed (timeout/auth/rate-limit/5xx): ' + JSON.stringify(resp && resp.error ? resp.error : resp).slice(0, 200) };\n} else {\n  try {\n    const raw = resp.choices && resp.choices[0] && resp.choices[0].message && resp.choices[0].message.content;\n    verdict = typeof raw === 'string' ? JSON.parse(raw) : raw;\n  } catch (e) {\n    verdict = { is_recoverable: false, confidence: 0, mapping: {}, unmapped_fields: [], reasoning: 'LLM response was not parseable JSON: ' + e.message };\n  }\n}\n// Structural guard against hallucinated shapes\nif (!verdict || typeof verdict !== 'object' || typeof verdict.confidence !== 'number' || typeof verdict.mapping !== 'object' || verdict.mapping === null) {\n  verdict = { is_recoverable: false, confidence: 0, mapping: {}, unmapped_fields: [], reasoning: 'Verdict failed structural validation.' };\n}\nconst prev = $('Contract Validation').first().json;\nreturn [{ json: { ...prev, is_recoverable: !!verdict.is_recoverable, confidence: verdict.confidence, mapping: verdict.mapping, unmapped_fields: verdict.unmapped_fields || [], reasoning: verdict.reasoning || '' } }];"
       },
       "id": "a1000001-0000-4000-8000-00000000000f",
       "name": "Parse Healer Verdict",
@@ -389,7 +390,7 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "INSERT INTO field_mapping_cache (rule_id, source_id, drifted_key, target_key, confidence, sample_value_hash, status) SELECT j->>'rule_id', j->>'source_id', j->>'drifted_key', j->>'target_key', (j->>'confidence')::numeric, j->>'sample_value_hash', 'active' FROM jsonb_array_elements($1::jsonb) AS j ON CONFLICT (source_id, drifted_key) DO UPDATE SET target_key = EXCLUDED.target_key, confidence = EXCLUDED.confidence, learned_at = now(), hit_count = 0 WHERE field_mapping_cache.status <> 'revoked' RETURNING rule_id;",
+        "query": "INSERT INTO field_mapping_cache (rule_id, source_id, drifted_key, target_key, confidence, sample_value_hash, status) SELECT j->>'rule_id', j->>'source_id', j->>'drifted_key', j->>'target_key', (j->>'confidence')::numeric, j->>'sample_value_hash', 'active' FROM jsonb_array_elements($1::jsonb) AS j ON CONFLICT (source_id, drifted_key) DO UPDATE SET target_key = EXCLUDED.target_key, confidence = EXCLUDED.confidence, learned_at = now() WHERE field_mapping_cache.status <> 'revoked' RETURNING rule_id;",
         "options": {
           "queryReplacement": "={{ [ JSON.stringify($('Mapping To Rows').all().map(r => r.json)) ] }}"
         }
@@ -569,7 +570,7 @@
         "url": "={{ $env.DLQ_ALERT_WEBHOOK_URL }}",
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ text: 'Event queued to DLQ', dlq_id: $('Prep DLQ Entry').first().json.dlq_id, failure_reason: $('Prep DLQ Entry').first().json.failureReason, replay_hint: 'POST /webhook/dlq-replay {\"dlq_id\":\"<uuid>\"}' }) }}",
+        "jsonBody": "={{ JSON.stringify({ text: 'Event queued to DLQ', dlq_id: $('Write DLQ').first().json.dlq_id, failure_reason: $('Prep DLQ Entry').first().json.failureReason, replay_hint: 'POST /webhook/dlq-replay {\"dlq_id\":\"<uuid>\"}' }) }}",
         "options": {
           "timeout": 15000
         }
@@ -605,7 +606,7 @@
     {
       "parameters": {
         "respondWith": "json",
-        "responseBody": "={{ { status: 'queued_to_dlq', dlq_id: $('Prep DLQ Entry').first().json.dlq_id, failure_reason: $('Prep DLQ Entry').first().json.failureReason } }}",
+        "responseBody": "={{ { status: 'queued_to_dlq', dlq_id: $('Write DLQ').first().json.dlq_id, failure_reason: $('Prep DLQ Entry').first().json.failureReason } }}",
         "options": {
           "responseCode": 202
         }
